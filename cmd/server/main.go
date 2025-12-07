@@ -196,6 +196,16 @@ func main() {
 		_, _ = w.Write([]byte(resp.Body))
 	})
 
+	addr := os.Getenv("APP_SERVER_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+
+	log.Printf("Go PHP app server listening on %s", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Fatal("HTTP Server failed:", err)
+	}
+
 	// Start actual Go HTTP server
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal("HTTP Server failed:", err)
