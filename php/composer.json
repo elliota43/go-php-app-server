@@ -1,0 +1,17 @@
+{
+    "name": "elliotanderson/go-php",
+    "autoload": {
+        "psr-4": {
+            "Go\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Elliot Anderson",
+            "email": "elliot.anderson43@gmail.com"
+        }
+    ],
+    "require": {
+        "baremetalphp/framework": "^0.1.4"
+    }
+}
