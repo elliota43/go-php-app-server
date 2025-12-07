@@ -5,7 +5,8 @@ declare(strict_types=1);
 use BareMetalPHP\Http\Request;
 use BareMetalPHP\Http\Response;
 use BareMetalPHP\Http\Kernel;
-
+use BareMetalPHP\Application;
+use BareMetalPHP\Routing\Router;
 /**
  * Build the $_SERVER array BareMetalPHP expects
  */
@@ -26,7 +27,7 @@ function build_server_array(array $payload): array
     // Map headers to PHP-style SERVER keys
     foreach ($headers as $name => $value) {
 
-        // Headers from Go are map[string][]string, so $value may be an array.
+        // go sends map[string][]string, so $value may be an array
         if (is_array($value)) {
             $valueString = implode(', ', $value);
         } else {
@@ -74,17 +75,15 @@ function make_baremetal_request(array $payload): Request
     $uri = $payload['uri'] ?? '/';
 
 
+
     // ---- Initialize everything so we never pass null ----
     $get     = [];
-    $post    = [];
-    $cookies = [];
-    $files   = [];
-
-    // ---- GET: parse query string from the URI ----
     $parts = parse_url($uri);
     if (!empty($parts['query'])) {
         parse_str($parts['query'], $get);
     }
+    $post    = [];
+    $files   = [];
 
     // ---- POST: only for standard form content-types ----
     $contentType = $server['CONTENT_TYPE'] ?? '';
@@ -99,29 +98,29 @@ function make_baremetal_request(array $payload): Request
     }
 
     // ---- Cookies: parse from HTTP_COOKIE header ----
+    $cookies = [];
     $cookieHeader = $server['HTTP_COOKIE'] ?? '';
     if ($cookieHeader !== '') {
         foreach (explode(';', $cookieHeader) as $cookiePart) {
             $cookiePart = trim($cookiePart);
-    
+
             // Skip empty or malformed segments
             if ($cookiePart === '' || !str_contains($cookiePart, '=')) {
                 continue;
             }
-    
+
             [$name, $value] = explode('=', $cookiePart, 2);
-    
-            $name  = trim((string) $name);
+
+            $name = trim((string) $name);
             $value = trim((string) $value);
-    
+
             if ($name === '') {
                 continue;
             }
-    
+
             $cookies[$name] = urldecode($value);
         }
     }
-    
 
     // ---- Build the framework Request object ----
 
@@ -129,21 +128,40 @@ function make_baremetal_request(array $payload): Request
 }
 
 /**
+ * Kernel singleton (so we don't re-bootstrap on every request).
+ * 
+ * Assumes bootstrap/app.php returns an Application instance
+ */
+function get_kernel(): Kernel
+{
+    static $kernel = null;
+
+    if ($kernel !== null) {
+        return $kernel;
+    }
+
+    // Adjust the path if bootstrap_app.php lives somewhere else
+    $bootstrap = require __DIR__ .'/bootstrap_app.php';
+
+    if (!is_array($bootstrap) || !isset($bootstrap['kernel'])) {
+        throw new \RuntimeException('bootstrap_app.php must return [\'kernel\' => Kernel] in its array.');
+    }
+
+    $kernel = $bootstrap['kernel'];
+
+    return $kernel;
+}
+/**
  * BareMetalPHP kernel execution wrapper
  */
-function handle_bridge_request(array $payload, Kernel $kernel): array
+function handle_bridge_request(array $payload, $kernel = null): array
 {
-    //$path = $payload['path'] ?? '/';
-
-    /* short-circuit root path to prove the pipeline
-    if ($path === '/' || $path === '') {
-        return [
-            'status' => 200,
-            'headers' => ['Content-Type' => 'text/plain; charset=UTF-8'],
-            'body' => 'Hello from BareMetalPHP App Server via Go/PHP worker bridge!\n',
-        ];
+    // Allow older code to pass a Kernel explicitly,
+    // but default to get_kernel() for the new worker.
+    if ($kernel === null) {
+        $kernel = get_kernel();
     }
-    */
+
     $request = make_baremetal_request($payload);
 
     /** @var Response $response */
@@ -155,3 +173,68 @@ function handle_bridge_request(array $payload, Kernel $kernel): array
         'body'    => $response->getBody(),
     ];
 }
+
+
+/**
+ * ---- Streaming helpers (length-prefixed frames) ---
+ */
+
+ function send_stream_frame(array $frame): void
+ {
+    $json = json_encode($frame, JSON_UNESCAPED_SLASHES);
+    if ($json === false) {
+        return;
+    }
+
+    $len = strlen($json);
+    $hdr = pack('N', $len); // 4-byte big-endian length
+
+    fwrite(STDOUT, $hdr . $json);
+    fflush(STDOUT);
+ }
+
+ function stream_response_headers(int $status, array $headers = [], ?string $data = null): void
+ {
+    $frame = [
+        'type' => 'headers',
+        'status' => $status,
+        'headers' => $headers,
+    ];
+
+    if ($data !== null) {
+        $frame['data'] = $data;
+    }
+    send_stream_frame($frame);
+ }
+
+ function stream_response_chunk(string $data): void
+ {
+    $frame = [
+        'type' => 'chunk',
+        'data' => $data,
+    ];
+
+    send_stream_frame($frame);
+ }
+
+ function stream_response_end(): void
+ {
+    send_stream_frame(['type' => 'end']);
+ }
+
+
+ function handle_bridge_request_streaming(array $payload): void
+ {
+    $kernel = get_kernel();
+    $request = make_baremetal_request($payload);
+
+    /** @var Response $response  */
+    $response = $kernel->handle($request);
+
+    $status = $response->getStatusCode();
+    $headers = $response->getHeaders();
+    $body = $response->getBody();
+
+    stream_response_headers($status, $headers, $body);
+    stream_response_end();
+ }

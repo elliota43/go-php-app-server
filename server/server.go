@@ -2,21 +2,30 @@ package server
 
 import (
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
+type SlowRequestConfig struct {
+	RoutePrefixes []string
+	Methods       []string
+	BodyThreshold int
+}
+
 type Server struct {
 	fastPool *WorkerPool
 	slowPool *WorkerPool
+	slowCfg  SlowRequestConfig
 }
 
 // NewServer builds fast and slow pools with shared settings.
-func NewServer(fastCount, slowCount, maxRequests int, requestTimeout time.Duration) (*Server, error) {
+func NewServer(fastCount, slowCount, maxRequests int, requestTimeout time.Duration, slowCfg SlowRequestConfig) (*Server, error) {
 	fp, err := NewPool(fastCount, maxRequests, requestTimeout)
 	if err != nil {
 		return nil, err
@@ -27,30 +36,42 @@ func NewServer(fastCount, slowCount, maxRequests int, requestTimeout time.Durati
 		return nil, err
 	}
 
+	// Apply defaults if caller leaves fields empty.
+	if slowCfg.BodyThreshold <= 0 {
+		slowCfg.BodyThreshold = 2_000_000
+	}
+
+	if len(slowCfg.Methods) == 0 {
+		slowCfg.Methods = []string{"PUT", "DELETE"}
+	}
+
 	return &Server{
 		fastPool: fp,
 		slowPool: sp,
+		slowCfg:  slowCfg,
 	}, nil
 }
 
-// Simple heuristics to decide if a request should go to the "slow" pool.
+// Simple heuristics to decide if a request should go to the "slow" pool. -- driven by SlowRequestConfig
 func (s *Server) IsSlowRequest(r *RequestPayload) bool {
-	// explicit slow routes
-	if strings.HasPrefix(r.Path, "/reports/") {
-		return true
+	// Route Prefixes
+	for _, prefix := range s.slowCfg.RoutePrefixes {
+		if prefix != "" && strings.HasPrefix(r.Path, prefix) {
+			return true
+		}
 	}
-	if strings.HasPrefix(r.Path, "/admin/analytics") {
+
+	// Body size threshold
+	if s.slowCfg.BodyThreshold > 0 && len(r.Body) > s.slowCfg.BodyThreshold {
 		return true
 	}
 
-	// big uploads
-	if len(r.Body) > 2_000_000 {
-		return true
-	}
-
-	// heavier verbs
-	if r.Method == "PUT" || r.Method == "DELETE" {
-		return true
+	// HTTP methods
+	method := strings.ToUpper(r.Method)
+	for _, m := range s.slowCfg.Methods {
+		if method == strings.ToUpper(m) {
+			return true
+		}
 	}
 
 	return false
@@ -61,6 +82,24 @@ func (s *Server) Dispatch(req *RequestPayload) (*ResponsePayload, error) {
 		return s.slowPool.Dispatch(req)
 	}
 	return s.fastPool.Dispatch(req)
+}
+
+func (s *Server) DispatchStream(req *RequestPayload, rw http.ResponseWriter) error {
+	var pool *WorkerPool
+	if s.IsSlowRequest(req) {
+		pool = s.slowPool
+	} else {
+		pool = s.fastPool
+	}
+
+	w := pool.NextWorker() // you may need to add this helper
+
+	return w.Stream(req, rw)
+}
+
+func (p *WorkerPool) NextWorker() *Worker {
+	i := atomic.AddUint32(&p.next, 1)
+	return p.workers[i%uint32(len(p.workers))]
 }
 
 // -------------------------------------------------------------

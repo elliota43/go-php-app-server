@@ -192,12 +192,19 @@ func main() {
 
 	timeout := time.Duration(cfg.RequestTimeoutMs) * time.Millisecond
 
+	slowCfg := server.SlowRequestConfig{
+		RoutePrefixes: cfg.SlowRoutes,
+		Methods:       cfg.SlowMethods,
+		BodyThreshold: cfg.SlowBodyThreshold,
+	}
+
 	// Create worker pools
 	srv, err := server.NewServer(
 		cfg.FastWorkers,
 		cfg.SlowWorkers,
 		cfg.MaxRequestsPerWorker,
 		timeout,
+		slowCfg,
 	)
 	if err != nil {
 		log.Fatal("Failed creating worker pools:", err)
@@ -236,12 +243,23 @@ func main() {
 		payload := BuildPayload(r)
 		start := time.Now()
 
-		// 3) Dispatch to either fast or slow pool
+		// TEMP streaming demo toggle by request header
+		if r.Header.Get("X-Go-Stream") == "1" {
+			if err := srv.DispatchStream(payload, w); err != nil {
+				writeWorkerError(w, err)
+				log.Printf("[req %s] %s %s -> stream error: %v", payload.ID, payload.Method, payload.Path, err)
+				return
+			}
+			elapsed := time.Since(start)
+			log.Printf("[req %s] %s %s -> streamed (%v)", payload.ID, payload.Method, payload.Path, elapsed)
+			return
+		}
+
+		// 2) Normal non-streaming path (unchanged)
 		resp, err := srv.Dispatch(payload)
 		if err != nil {
 			writeWorkerError(w, err)
 			log.Println("[req %s] %s %s -> worker error: %v", payload.ID, payload.Method, payload.Path, err)
-			http.Error(w, "Worker error: "+err.Error(), 500)
 			return
 		}
 
@@ -301,6 +319,10 @@ type AppServerConfig struct {
 	RequestTimeoutMs     int          `json:"request_timeout_ms"`
 	MaxRequestsPerWorker int          `json:"max_requests_per_worker"`
 	Static               []StaticRule `json:"static"`
+
+	SlowRoutes        []string `json:"slow_routes"`
+	SlowMethods       []string `json:"slow_methods"`
+	SlowBodyThreshold int      `json:"slow_body_threshold"`
 }
 
 // defaultConfig returns sane defaults when go_appserver.json
@@ -320,6 +342,9 @@ func defaultConfig() *AppServerConfig {
 			{Prefix: "/images/", Dir: "public/images"},
 			{Prefix: "/img/", Dir: "public/img"},
 		},
+		SlowRoutes:        []string{"/reports/", "/admin/analytics"},
+		SlowMethods:       []string{"PUT", "DELETE"},
+		SlowBodyThreshold: 2_000_000,
 	}
 }
 
@@ -340,23 +365,40 @@ func loadConfig(projectRoot string) *AppServerConfig {
 		return defaultConfig()
 	}
 
-	// Apply defaults / clamps with logging so misconfigurations are obvious.
+	// Pull a copy of defaults for use below
+	def := defaultConfig()
+
+	//
+	// -------------------------
+	// Core config validation
+	// -------------------------
+	//
+
 	if cfg.FastWorkers <= 0 {
-		log.Printf("[config] fast_workers=%d is invalid, falling back to 4", cfg.FastWorkers)
-		cfg.FastWorkers = 4
+		log.Printf("[config] fast_workers=%d is invalid, falling back to %d", cfg.FastWorkers, def.FastWorkers)
+		cfg.FastWorkers = def.FastWorkers
 	}
+
 	if cfg.SlowWorkers < 0 {
-		log.Printf("[config] slow_workers=%d is invalid, falling back to 2", cfg.SlowWorkers)
-		cfg.SlowWorkers = 2
+		log.Printf("[config] slow_workers=%d is invalid, falling back tp %d", cfg.SlowWorkers, def.SlowWorkers)
+		cfg.SlowWorkers = def.SlowWorkers
 	}
+
 	if cfg.RequestTimeoutMs <= 0 {
-		log.Printf("[config] request_timeout_ms=%d is invalid, falling back to 10000ms", cfg.RequestTimeoutMs)
-		cfg.RequestTimeoutMs = 10000
+		log.Printf("[config] request_timeout_ms=%d is invalid, falling back to %dms", cfg.RequestTimeoutMs, def.RequestTimeoutMs)
+		cfg.RequestTimeoutMs = def.RequestTimeoutMs
 	}
+
 	if cfg.MaxRequestsPerWorker <= 0 {
-		log.Printf("[config] max_requests_per_worker=%d is invalid, falling back to 1000", cfg.MaxRequestsPerWorker)
-		cfg.MaxRequestsPerWorker = 1000
+		log.Printf("[config] max_requests_per_worker=%d is invalid, falling back to %d", cfg.MaxRequestsPerWorker, def.MaxRequestsPerWorker)
+		cfg.MaxRequestsPerWorker = def.MaxRequestsPerWorker
 	}
+
+	//
+	// -------------------------
+	// Static rules validation
+	// -------------------------
+	//
 	if len(cfg.Static) == 0 {
 		log.Printf("[config] no static rules configured, using default static rules")
 		cfg.Static = defaultConfig().Static
@@ -373,5 +415,28 @@ func loadConfig(projectRoot string) *AppServerConfig {
 		}
 	}
 
+	//
+	// -------------------------
+	// Slow-request config
+	// -------------------------
+	//
+
+	// Route prefixes
+	if len(cfg.SlowRoutes) == 0 {
+		cfg.SlowRoutes = def.SlowRoutes
+		log.Printf("[config] stow_routes missing, using defaults: %v", cfg.SlowRoutes)
+	}
+
+	// Methods to treat as slow
+	if len(cfg.SlowMethods) == 0 {
+		cfg.SlowMethods = def.SlowMethods
+		log.Printf("[config] slow_methods missing, using defaults: %v", cfg.SlowMethods)
+	}
+
+	// Body size threshold
+	if cfg.SlowBodyThreshold <= 0 {
+		cfg.SlowBodyThreshold = def.SlowBodyThreshold
+		log.Printf("[config] slow_body_threshold invalid, using default: %d bytes", cfg.SlowBodyThreshold)
+	}
 	return &cfg
 }

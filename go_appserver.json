@@ -10,7 +10,8 @@
       { "prefix": "/css/",    "dir": "public/css" },
       { "prefix": "/js/",     "dir": "public/js" },
       { "prefix": "/images/", "dir": "public/images" },
-      { "prefix": "/img/",    "dir": "public/img" }
+      { "prefix": "/img/",    "dir": "public/img" },
+      { "prefix": "/", "dir": "public" }
     ]
   }
   
