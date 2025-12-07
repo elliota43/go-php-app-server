@@ -2,32 +2,20 @@
 
 declare(strict_types=1);
 
-
 use BareMetalPHP\Application;
 use BareMetalPHP\Http\Kernel;
-use BareMetalPHP\Http\Request;
 
-// load composer
-
+// Load Composer autoload (framework lives in php/vendor)
 require __DIR__ . '/vendor/autoload.php';
 
-// -------------------------------------------------
-// Boot the BareMetalPHP Application once (persistent in worker)
-// -------------------------------------------------
+// Create the application container
+$app = new Application();
 
-// Base path = parent of the /php folder
-$basePath = dirname(__DIR__);
+// Optionally set global instance if your framework uses it
+Application::setInstance($app);
 
-// create framework application
-$app = new Application($basePath);
-
-// load service providers 
-if (function_exists('config') && config('app.providers')) {
-    $app->registerProviders(config('app.providers'));
-}
-
-// some apps use auto-detection / defaults, so ensure providers are loaded:
-foreach([
+// Manually register all the core service providers your framework ships with
+$app->registerProviders([
     BareMetalPHP\Providers\ConfigServiceProvider::class,
     BareMetalPHP\Providers\RoutingServiceProvider::class,
     BareMetalPHP\Providers\HttpServiceProvider::class,
@@ -35,19 +23,15 @@ foreach([
     BareMetalPHP\Providers\DatabaseServiceProvider::class,
     BareMetalPHP\Providers\LoggingServiceProvider::class,
     BareMetalPHP\Providers\AppServiceProvider::class,
-] as $provider) {
-    if (class_exists($provider)) {
-        $app->registerProviders([$provider]);
-    }
-}
+    BareMetalPHP\Providers\FrontendServiceProvider::class,
+]);
 
-// boot service providers
+// Boot providers (this will also cause RoutingServiceProvider to load routes/web.php)
 $app->boot();
 
-// resolve http kernel
+// Resolve the HTTP kernel
 $kernel = $app->make(Kernel::class);
 
-// return to worker.php
 return [
     'app'    => $app,
     'kernel' => $kernel,

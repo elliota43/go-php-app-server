@@ -75,6 +75,17 @@ function make_baremetal_request(array $payload): Request
  */
 function handle_bridge_request(array $payload, Kernel $kernel): array
 {
+    //$path = $payload['path'] ?? '/';
+
+    /* short-circuit root path to prove the pipeline
+    if ($path === '/' || $path === '') {
+        return [
+            'status' => 200,
+            'headers' => ['Content-Type' => 'text/plain; charset=UTF-8'],
+            'body' => 'Hello from BareMetalPHP App Server via Go/PHP worker bridge!\n',
+        ];
+    }
+    */
     $request = make_baremetal_request($payload);
 
     /** @var Response $response */
