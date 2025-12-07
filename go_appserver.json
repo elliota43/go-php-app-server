@@ -1,0 +1,16 @@
+{
+    "fast_workers": 4,
+    "slow_workers": 2,
+    "hot_reload": true,
+    "requrest_timeout_ms": 10000,
+    "max_requests_per_worker": 1000,
+    "static": [
+      { "prefix": "/assets/", "dir": "public/assets" },
+      { "prefix": "/build/",  "dir": "public/build" },
+      { "prefix": "/css/",    "dir": "public/css" },
+      { "prefix": "/js/",     "dir": "public/js" },
+      { "prefix": "/images/", "dir": "public/images" },
+      { "prefix": "/img/",    "dir": "public/img" }
+    ]
+  }
+  

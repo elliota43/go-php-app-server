@@ -1,31 +1,28 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"go-php/server"
+	"go-php/server" // IMPORTANT: change this if your module path differs
 
 	"github.com/google/uuid"
 )
 
-// -------------------------------------------------------------------------------
-// Static file routing
-// -------------------------------------------------------------------------------
+//
+// -------------------------------------------------------------
+// STATIC FILE SERVING
+// -------------------------------------------------------------
+//
 
-type StaticRule struct {
-	Prefix string // URL prefix e.g. "/assets/"
-	Dir    string // relative to project root, e.g. "public/assets"
-}
-
-// tryServeStatic tries to serve from one of the static rules.
-// Returns true if it served a file, false if PHP should handle it.
+// tryServeStatic: serves static assets based on StaticRule in config
 func tryServeStatic(w http.ResponseWriter, r *http.Request, projectRoot string, rules []StaticRule) bool {
-	// only serve static for GET/HEAD
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return false
 	}
@@ -37,15 +34,13 @@ func tryServeStatic(w http.ResponseWriter, r *http.Request, projectRoot string, 
 			continue
 		}
 
-		// strip prefix from URL path
 		relPath := strings.TrimPrefix(path, rule.Prefix)
 		relPath = filepath.Clean(relPath)
 
-		// build full filesystem path
 		baseDir := filepath.Join(projectRoot, rule.Dir)
 		fullPath := filepath.Join(baseDir, relPath)
 
-		// ensure fullPath stays under baseDir (no ../../ escape)
+		// Prevent ../../ escapes
 		if !strings.HasPrefix(fullPath, baseDir) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return true
@@ -53,7 +48,6 @@ func tryServeStatic(w http.ResponseWriter, r *http.Request, projectRoot string, 
 
 		info, err := os.Stat(fullPath)
 		if err != nil || info.IsDir() {
-			// no file here, let PHP decide or next rule try
 			continue
 		}
 
@@ -64,9 +58,11 @@ func tryServeStatic(w http.ResponseWriter, r *http.Request, projectRoot string, 
 	return false
 }
 
-// -------------------------------------------------------------------------------
-// BuildPayload: Converts HTTP request → bridge format
-// -------------------------------------------------------------------------------
+//
+// -------------------------------------------------------------
+// REQUEST PAYLOAD TRANSFORM (HTTP → PHP Worker)
+// -------------------------------------------------------------
+//
 
 func BuildPayload(r *http.Request) *server.RequestPayload {
 	headers := map[string]string{}
@@ -87,9 +83,11 @@ func BuildPayload(r *http.Request) *server.RequestPayload {
 	}
 }
 
-// -------------------------------------------------------------------------------
-// getProjectRoot: finds directory of go.mod
-// -------------------------------------------------------------------------------
+//
+// -------------------------------------------------------------
+// PROJECT ROOT DISCOVERY (dir containing go.mod)
+// -------------------------------------------------------------
+//
 
 func getProjectRoot() string {
 	wd, err := os.Getwd()
@@ -102,66 +100,72 @@ func getProjectRoot() string {
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
 			return dir
 		}
-
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			// hit filesystem root
 			return wd
 		}
-
 		dir = parent
 	}
 }
 
-// -------------------------------
-// MAIN
-// -------------------------------
+//
+// -------------------------------------------------------------
+// MAIN SERVER SETUP
+// -------------------------------------------------------------
+//
 
 func main() {
 	projectRoot := getProjectRoot()
 
-	// configure static routes (similar to nginx locations)
-	staticRules := []StaticRule{
-		{Prefix: "/assets/", Dir: "public/assets"},
-		{Prefix: "/build/", Dir: "public/build"},
-		{Prefix: "/css/", Dir: "public/css"},
-		{Prefix: "/js/", Dir: "public/js"},
-		{Prefix: "/images/", Dir: "public/images"},
-		{Prefix: "/img/", Dir: "public/img"},
-	}
+	// Load go_appserver.json (or defaults)
+	cfg := loadConfig(projectRoot)
 
-	// Create multipools: 4 fast workers, 2 slow workers
-	srv, err := server.NewServer(4, 2)
+	timeout := time.Duration(cfg.RequestTimeoutMs) * time.Millisecond
+
+	// Create worker pools
+	srv, err := server.NewServer(
+		cfg.FastWorkers,
+		cfg.SlowWorkers,
+		cfg.MaxRequestsPerWorker,
+		timeout,
+	)
 	if err != nil {
 		log.Fatal("Failed creating worker pools:", err)
 	}
 
-	// optional: enable hot reload if env is set
-	devHot := os.Getenv("GO_PHP_HOT_RELOAD") == "1"
-	if devHot {
+	// Hot reload (if enabled)
+	if cfg.HotReload {
 		if err := srv.EnableHotReload(projectRoot); err != nil {
-			log.Println("hot reload disabled:", err)
+			log.Println("Hot reload disabled:", err)
 		} else {
-			log.Println("hot reload enabled (GO_PHP_HOT_RELOAD=1)")
+			log.Println("Hot reload enabled")
 		}
 	}
 
-	log.Println("BareMetalPHP App Server starting on :8080")
-	log.Println("Fast workers: 4 | Slow workers: 2")
-	log.Println("Static rules:")
-	for _, rule := range staticRules {
-		log.Printf("  %s -> %s\n", rule.Prefix, filepath.Join(projectRoot, rule.Dir))
+	log.Println("=============================================")
+	log.Println(" BareMetalPHP Go App Server Started :8080")
+	log.Println("=============================================")
+	log.Printf(" Fast workers: %d", cfg.FastWorkers)
+	log.Printf(" Slow workers: %d", cfg.SlowWorkers)
+	log.Printf(" Timeout: %dms", cfg.RequestTimeoutMs)
+	log.Printf(" Max requests/worker: %d", cfg.MaxRequestsPerWorker)
+	log.Println(" Static rules:")
+	for _, rule := range cfg.Static {
+		log.Printf("   %s → %s", rule.Prefix, filepath.Join(projectRoot, rule.Dir))
 	}
+	log.Println("=============================================")
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// 1) Static-first for known asset prefixes
-		if tryServeStatic(w, r, projectRoot, staticRules) {
+
+		// 1) Try static assets first
+		if tryServeStatic(w, r, projectRoot, cfg.Static) {
 			return
 		}
 
-		// 2) Everything else goes to PHP first
+		// 2) Transform request → payload for PHP worker
 		payload := BuildPayload(r)
 
+		// 3) Dispatch to either fast or slow pool
 		resp, err := srv.Dispatch(payload)
 		if err != nil {
 			log.Println("Worker error:", err)
@@ -169,29 +173,99 @@ func main() {
 			return
 		}
 
-		// 3) Optional: PHP 404 → last-chance static fallback
+		// 4) If PHP returns 404 → last-chance static fallback
 		if resp.Status == http.StatusNotFound {
-			if tryServeStatic(w, r, projectRoot, staticRules) {
+			if tryServeStatic(w, r, projectRoot, cfg.Static) {
 				return
 			}
 		}
 
-		// 4) Write PHP response
+		// Write headers
 		for k, v := range resp.Headers {
 			w.Header().Set(k, v)
 		}
 
+		// Write status
 		status := resp.Status
 		if status == 0 {
 			status = 200
 		}
 		w.WriteHeader(status)
 
+		// Write body
 		_, _ = w.Write([]byte(resp.Body))
 	})
 
-	// Start the HTTP server
+	// Start actual Go HTTP server
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal("HTTP Server failed:", err)
 	}
+}
+
+type StaticRule struct {
+	Prefix string `json:"prefix"`
+	Dir    string `json:"dir"`
+}
+
+type AppServerConfig struct {
+	FastWorkers          int          `json:"fast_workers"`
+	SlowWorkers          int          `json:"slow_workers"`
+	HotReload            bool         `json:"hot_reload"`
+	RequestTimeoutMs     int          `json:"request_timeout_ms"`
+	MaxRequestsPerWorker int          `json:"max_requests_per_worker"`
+	Static               []StaticRule `json:"static"`
+}
+
+// defaultConfig returns sane defaults when go_appserver.json
+// is missing or invalid.
+func defaultConfig() *AppServerConfig {
+	return &AppServerConfig{
+		FastWorkers:          4,
+		SlowWorkers:          2,
+		HotReload:            false,
+		RequestTimeoutMs:     10000, // 10s
+		MaxRequestsPerWorker: 1000,
+		Static: []StaticRule{
+			{Prefix: "/assets/", Dir: "public/assets"},
+			{Prefix: "/build/", Dir: "public/build"},
+			{Prefix: "/css/", Dir: "public/css"},
+			{Prefix: "/js/", Dir: "public/js"},
+			{Prefix: "/images/", Dir: "public/images"},
+			{Prefix: "/img/", Dir: "public/img"},
+		},
+	}
+}
+
+// loadConfig tries to read go_appserver.json from projectRoot;
+// falls back to defaults on any error.
+func loadConfig(projectRoot string) *AppServerConfig {
+	cfgPath := filepath.Join(projectRoot, "go_appserver.json")
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return defaultConfig()
+	}
+
+	var cfg AppServerConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return defaultConfig()
+	}
+
+	if cfg.FastWorkers <= 0 {
+		cfg.FastWorkers = 4
+	}
+	if cfg.SlowWorkers < 0 {
+		cfg.SlowWorkers = 2
+	}
+	if cfg.RequestTimeoutMs <= 0 {
+		cfg.RequestTimeoutMs = 10000
+	}
+	if cfg.MaxRequestsPerWorker <= 0 {
+		cfg.MaxRequestsPerWorker = 1000
+	}
+	if len(cfg.Static) == 0 {
+		cfg.Static = defaultConfig().Static
+	}
+
+	return &cfg
 }

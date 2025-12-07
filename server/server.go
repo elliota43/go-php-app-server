@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -14,13 +15,14 @@ type Server struct {
 	slowPool *WorkerPool
 }
 
-func NewServer(fastCount, slowCount int) (*Server, error) {
-	fp, err := NewPool(fastCount)
+// NewServer builds fast and slow pools with shared settings.
+func NewServer(fastCount, slowCount, maxRequests int, requestTimeout time.Duration) (*Server, error) {
+	fp, err := NewPool(fastCount, maxRequests, requestTimeout)
 	if err != nil {
 		return nil, err
 	}
 
-	sp, err := NewPool(slowCount)
+	sp, err := NewPool(slowCount, maxRequests, requestTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -31,12 +33,9 @@ func NewServer(fastCount, slowCount int) (*Server, error) {
 	}, nil
 }
 
-// Classification logic -----------------------
-
+// Simple heuristics to decide if a request should go to the "slow" pool.
 func (s *Server) IsSlowRequest(r *RequestPayload) bool {
-	// example heuristics
-
-	//explicit slow routes (reports, exports)
+	// explicit slow routes
 	if strings.HasPrefix(r.Path, "/reports/") {
 		return true
 	}
@@ -49,7 +48,7 @@ func (s *Server) IsSlowRequest(r *RequestPayload) bool {
 		return true
 	}
 
-	// PUT/DELETE often heavier
+	// heavier verbs
 	if r.Method == "PUT" || r.Method == "DELETE" {
 		return true
 	}
@@ -57,7 +56,6 @@ func (s *Server) IsSlowRequest(r *RequestPayload) bool {
 	return false
 }
 
-// Dispatch -----------------------
 func (s *Server) Dispatch(req *RequestPayload) (*ResponsePayload, error) {
 	if s.IsSlowRequest(req) {
 		return s.slowPool.Dispatch(req)
@@ -65,7 +63,11 @@ func (s *Server) Dispatch(req *RequestPayload) (*ResponsePayload, error) {
 	return s.fastPool.Dispatch(req)
 }
 
-// markAllWorkersDead forces both pools to recreate workers on next request
+// -------------------------------------------------------------
+// Hot reload support
+// -------------------------------------------------------------
+
+// markAllWorkersDead forces both pools to recreate workers on next request.
 func (s *Server) markAllWorkersDead() {
 	for _, w := range s.fastPool.workers {
 		w.markDead()
@@ -75,27 +77,29 @@ func (s *Server) markAllWorkersDead() {
 	}
 }
 
-// EnableHotReload watches PHP and routes directories in dev mode
-// and marks all workers dead when code changes so they restart lazily
+// EnableHotReload watches php/ and routes/ under projectRoot and marks all
+// workers dead when changes are detected, so they restart lazily on next request.
 func (s *Server) EnableHotReload(projectRoot string) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
 	}
 
-	// directories to watch
+	// Directories to watch
 	watchDirs := []string{
 		filepath.Join(projectRoot, "php"),
 		filepath.Join(projectRoot, "routes"),
 	}
 
 	for _, dir := range watchDirs {
-		if info, err := os.Stat(dir); err == nil && info.IsDir() {
-			if err := watcher.Add(dir); err != nil {
-				log.Println("hot reload: failed to watch", dir, ":", err)
-			} else {
-				log.Println("hot reload: watching", dir)
-			}
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if err := watcher.Add(dir); err != nil {
+			log.Println("hot reload: failed to watch", dir, ":", err)
+		} else {
+			log.Println("hot reload: watching", dir)
 		}
 	}
 
@@ -107,7 +111,7 @@ func (s *Server) EnableHotReload(projectRoot string) error {
 					return
 				}
 				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
-					log.Println("hot reload: detected change in", ev.Name, "- recycling workers...")
+					log.Println("hot reload: change detected in", ev.Name, "- recycling workers...")
 					s.markAllWorkersDead()
 				}
 
@@ -115,7 +119,7 @@ func (s *Server) EnableHotReload(projectRoot string) error {
 				if !ok {
 					return
 				}
-				log.Println("hot reload: watcher error:", err)
+				log.Println("hot reload watcher error:", err)
 			}
 		}
 	}()

@@ -1,17 +1,22 @@
 package server
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+	"time"
+)
 
 type WorkerPool struct {
 	workers []*Worker
 	next    uint32
 }
 
-func NewPool(count int) (*WorkerPool, error) {
+// NewPool creates a pool with count workers, each configured
+// with maxRequests and requestTimeout.
+func NewPool(count int, maxRequests int, requestTimeout time.Duration) (*WorkerPool, error) {
 	workers := make([]*Worker, 0, count)
 
 	for i := 0; i < count; i++ {
-		w, err := NewWorker()
+		w, err := NewWorker(maxRequests, requestTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -24,7 +29,6 @@ func NewPool(count int) (*WorkerPool, error) {
 }
 
 func (p *WorkerPool) Dispatch(req *RequestPayload) (*ResponsePayload, error) {
-	// Round-robin
 	i := atomic.AddUint32(&p.next, 1)
 	w := p.workers[i%uint32(len(p.workers))]
 
