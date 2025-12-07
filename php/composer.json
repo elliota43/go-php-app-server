@@ -12,6 +12,6 @@
         }
     ],
     "require": {
-        "baremetalphp/framework": "^0.1.4"
+        "baremetalphp/framework": "dev-main"
     }
 }

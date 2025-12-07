@@ -1,11 +1,11 @@
 package server
 
 type RequestPayload struct {
-	ID      string            `json:"id"`
-	Method  string            `json:"method"`
-	Path    string            `json:"path"`
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"`
+	ID      string              `json:"id"`
+	Method  string              `json:"method"`
+	Path    string              `json:"path"`
+	Headers map[string][]string `json:"headers"`
+	Body    string              `json:"body"`
 }
 
 type ResponsePayload struct {

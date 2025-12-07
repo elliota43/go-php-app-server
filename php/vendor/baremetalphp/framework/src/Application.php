@@ -11,6 +11,8 @@ use ReflectionParameter;
 
 class Application
 {
+    public const VERSION = '0.1.4';
+    
     protected static ?Application $instance = null;
 
     protected array $bindings = [];

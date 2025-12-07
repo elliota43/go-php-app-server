@@ -14,13 +14,31 @@ class Request
         protected array $post,
         protected array $server,
         protected array $cookies,
-        protected array $files
+        protected array $files,
+        protected string $rawBody = ''
     )
     {}
 
     public static function fromGlobals(): self
     {
-        return new self($_GET, $_POST, $_SERVER, $_COOKIE, $_FILES);
+        $rawBody = file_get_contents('php://input') ?: '';
+        return new self($_GET, $_POST, $_SERVER, $_COOKIE, $_FILES, $rawBody);
+    }
+
+    public static function fromParts(
+        array $server,
+        string $body,
+        array $get = [],
+        array $post = [],
+        array $cookies = [],
+        array $files = [],
+    ): self {
+        return new self($get, $post, $server, $cookies, $files, $body);
+    }
+
+    public function rawBody(): string
+    {
+        return $this->rawBody;
     }
 
     public function method(): string

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -65,19 +66,61 @@ func tryServeStatic(w http.ResponseWriter, r *http.Request, projectRoot string, 
 //
 
 func BuildPayload(r *http.Request) *server.RequestPayload {
-	headers := map[string]string{}
-	for k, v := range r.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
+	// Generate a request ID for logging + tracing
+	reqID := uuid.New().String()
+
+	// copy headers into map[string][]string with canonicalized names
+	headers := make(map[string][]string, len(r.Header)+3)
+
+	for name, values := range r.Header {
+		canonical := http.CanonicalHeaderKey(name)
+
+		// copy the slice so we don't share backing arrays with r.Header
+		copied := make([]string, len(values))
+		copy(copied, values)
+
+		headers[canonical] = copied
+	}
+
+	// ensure Host is present
+	host := r.Host
+	if host == "" && r.URL != nil {
+		host = r.URL.Host
+	}
+	if host != "" {
+		headers["Host"] = []string{host}
+	}
+
+	// add / extend X-Forwarded-For with the direct client IP
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && ip != "" {
+		if existing, ok := headers["X-Forwarded-For"]; ok && len(existing) > 0 {
+			headers["X-Forwarded-For"] = []string{existing[0] + ", " + ip}
+		} else {
+			headers["X-Forwarded-For"] = []string{ip}
 		}
 	}
 
-	bodyBytes, _ := io.ReadAll(r.Body)
+	// Attach X-Request-Id if the client didn't send one
+	if _, ok := headers["X-Request-Id"]; !ok {
+		headers["X-Request-Id"] = []string{reqID}
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("[request %s] error reading body: %v", reqID, err)
+	}
+	_ = r.Body.Close()
+
+	// Preserve the full RequestURI (includes query string)
+	path := r.URL.RequestURI()
+	if path == "" {
+		path = r.URL.Path
+	}
 
 	return &server.RequestPayload{
-		ID:      uuid.NewString(),
+		ID:      reqID,
 		Method:  r.Method,
-		Path:    r.URL.RequestURI(),
+		Path:    path,
 		Headers: headers,
 		Body:    string(bodyBytes),
 	}

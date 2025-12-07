@@ -44,6 +44,7 @@ class Application
             'migrate:rollback' => MigrateRollbackCommand::class,
             'make:migration' => MakeMigrationCommand::class,
             'frontend:install' => Commands\InstallFrontendCommand::class,
+            'app:install-go-server' => Commands\InstallGoAppServerCommand::class,
         ];
 
     }

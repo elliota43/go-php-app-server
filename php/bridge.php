@@ -11,25 +11,51 @@ use BareMetalPHP\Http\Kernel;
  */
 function build_server_array(array $payload): array
 {
-    $method  = strtoupper($payload['method'] ?? 'GET');
-    $uri     = $payload['path'] ?? '/';
-    $headers = $payload['headers'] ?? [];
-    $body    = $payload['body'] ?? '';
+    $server = [];
 
-    $server = [
-        'REQUEST_METHOD' => $method,
-        'REQUEST_URI'    => $uri,
-        'CONTENT_LENGTH' => strlen($body),
-    ];
+    $method = $payload['method'] ?? 'GET';
+    $path = $payload['path'] ?? '/';
+
+    $server['REQUEST_METHOD'] = $method;
+    $server['REQUEST_URI'] = $path;
+    $server['SCRIPT_NAME'] = $path;
+    $server['PHP_SELF'] = $path;
+
+    $headers = $payload['headers'] ?? [];
 
     // Map headers to PHP-style SERVER keys
     foreach ($headers as $name => $value) {
-        $upper = strtoupper(str_replace('-', '_', $name));
-        $server["HTTP_$upper"] = $value;
 
-        if ($upper === 'CONTENT_TYPE') {
-            $server['CONTENT_TYPE'] = $value;
+        // Headers from Go are map[string][]string, so $value may be an array.
+        if (is_array($value)) {
+            $valueString = implode(', ', $value);
+        } else {
+            $valueString = (string) $value;
         }
+
+        $normalized = strtolower($name);
+
+        // Host -> SERVER_NAME / HTTP_HOST
+        if ($normalized === 'host') {
+            $server['HTTP_HOST'] = $valueString;
+            $server['SERVER_NAME'] = $valueString;
+            continue;
+        }
+
+        // Special-case content headers (PHP uses CONTENT_*)
+        if ($normalized === 'content-type') {
+            $server['CONTENT_TYPE'] = $valueString;
+            continue;
+        }
+
+        if ($normalized === 'content-length') {
+            $server['CONTENT_LENGTH'] = $valueString;
+            continue;
+        }
+
+        // Everything else -> HTTP_FOO_BAR style
+        $key = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
+        $server[$key] = $valueString;
     }
 
     return $server;
@@ -40,34 +66,66 @@ function build_server_array(array $payload): array
  */
 function make_baremetal_request(array $payload): Request
 {
-    $path    = $payload['path']    ?? '/';
-    $body    = $payload['body']    ?? '';
-    $headers = $payload['headers'] ?? [];
-
-    // Build fake $_SERVER
+    // Build SERVER-style array first (REQUEST_METHOD, REQUEST_URI, HTTP_*, etc.)
     $server = build_server_array($payload);
 
-    // Parse GET params
-    $queryString = parse_url($path, PHP_URL_QUERY);
-    $get = [];
-    if ($queryString) {
-        parse_str($queryString, $get);
+    // Raw body from Go payload
+    $body = $payload['body'] ?? '';
+    $uri = $payload['uri'] ?? '/';
+
+
+    // ---- Initialize everything so we never pass null ----
+    $get     = [];
+    $post    = [];
+    $cookies = [];
+    $files   = [];
+
+    // ---- GET: parse query string from the URI ----
+    $parts = parse_url($uri);
+    if (!empty($parts['query'])) {
+        parse_str($parts['query'], $get);
     }
 
-    // Parse POST form bodies
-    $post = [];
-    if (isset($headers['Content-Type']) &&
-        str_starts_with($headers['Content-Type'], 'application/x-www-form-urlencoded')) {
+    // ---- POST: only for standard form content-types ----
+    $contentType = $server['CONTENT_TYPE'] ?? '';
+
+    if (str_starts_with($contentType, 'application/x-www-form-urlencoded')) {
         parse_str($body, $post);
+    } else if (str_starts_with($contentType, 'multipart/form-data')) {
+        // Real multipart parsing is non-trivial here.
+        // for now we leave $post / $files empty in Go mode.
+        $post = [];
+        $files = [];
     }
 
-    return new Request(
-        get: $get,
-        post: $post,
-        server: $server,
-        cookies: [],
-        files: []
-    );
+    // ---- Cookies: parse from HTTP_COOKIE header ----
+    $cookieHeader = $server['HTTP_COOKIE'] ?? '';
+    if ($cookieHeader !== '') {
+        foreach (explode(';', $cookieHeader) as $cookiePart) {
+            $cookiePart = trim($cookiePart);
+    
+            // Skip empty or malformed segments
+            if ($cookiePart === '' || !str_contains($cookiePart, '=')) {
+                continue;
+            }
+    
+            [$name, $value] = explode('=', $cookiePart, 2);
+    
+            $name  = trim((string) $name);
+            $value = trim((string) $value);
+    
+            if ($name === '') {
+                continue;
+            }
+    
+            $cookies[$name] = urldecode($value);
+        }
+    }
+    
+
+    // ---- Build the framework Request object ----
+
+    return Request::fromParts($server, $body, $get, $post, $cookies, $files);
 }
 
 /**
