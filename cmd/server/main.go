@@ -263,14 +263,12 @@ func main() {
 			return
 		}
 
-		// 4) If PHP returns 404 → last-chance static fallback
 		if resp.Status == http.StatusNotFound {
 			if tryServeStatic(w, r, projectRoot, cfg.Static) {
 				return
 			}
 		}
 
-		// Write headers
 		for k, v := range resp.Headers {
 			w.Header().Set(k, v)
 		}
