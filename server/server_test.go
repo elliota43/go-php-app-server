@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -199,5 +200,139 @@ func TestRecordLatencyPromotesSlowPrefix(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected /reports to be promoted to slow pool; got %+v", s.slowCfg.RoutePrefixes)
+	}
+}
+
+func TestNewServerWithDefaults(t *testing.T) {
+	slowCfg := SlowRequestConfig{
+		RoutePrefixes: nil,
+		Methods:       nil,
+		BodyThreshold: 0,
+	}
+
+	s, err := NewServer(1, 1, 1000, time.Second, slowCfg)
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+
+	if s.slowCfg.BodyThreshold != 2_000_000 {
+		t.Fatalf("expected BodyThreshold to be set to default, got %d", s.slowCfg.BodyThreshold)
+	}
+
+	if len(s.slowCfg.Methods) == 0 {
+		t.Fatalf("expected Methods to be set to default")
+	}
+}
+
+func TestDispatchStreamWithNoWorkers(t *testing.T) {
+	fast := &WorkerPool{workers: []*Worker{}}
+	slow := &WorkerPool{workers: []*Worker{}}
+
+	s := &Server{
+		fastPool: fast,
+		slowPool: slow,
+		slowCfg: SlowRequestConfig{
+			RoutePrefixes: []string{"/slow"},
+		},
+	}
+
+	req := &RequestPayload{
+		Method: "GET",
+		Path:   "/test",
+	}
+
+	rr := httptest.NewRecorder()
+	err := s.DispatchStream(req, rr)
+	if err == nil {
+		t.Fatalf("expected error when no workers available")
+	}
+}
+
+func TestIsSlowRequestWithEmptyPrefix(t *testing.T) {
+	s := &Server{
+		slowCfg: SlowRequestConfig{
+			RoutePrefixes: []string{""},
+			Methods:       nil,
+			BodyThreshold: 0,
+		},
+	}
+
+	req := &RequestPayload{
+		Method: "GET",
+		Path:   "/test",
+	}
+
+	if s.IsSlowRequest(req) {
+		t.Fatalf("expected empty prefix to not match")
+	}
+}
+
+func TestRecordLatencyDoesNotPromoteIfAlreadyInSlowPrefix(t *testing.T) {
+	s := &Server{
+		slowCfg: SlowRequestConfig{
+			RoutePrefixes: []string{"/reports"},
+		},
+		routeStats: make(map[string]*routeStats),
+	}
+
+	// Feed slow samples
+	for i := 0; i < 20; i++ {
+		s.RecordLatency("/reports/daily", 600*time.Millisecond)
+	}
+
+	// Should not add duplicate
+	count := 0
+	for _, p := range s.slowCfg.RoutePrefixes {
+		if p == "/reports" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected /reports to appear only once, got %d times", count)
+	}
+}
+
+func TestRecordLatencyWithShortPath(t *testing.T) {
+	s := &Server{
+		slowCfg: SlowRequestConfig{
+			RoutePrefixes: []string{},
+		},
+		routeStats: make(map[string]*routeStats),
+	}
+
+	// Test with path that has no second slash
+	s.RecordLatency("/test", 100*time.Millisecond)
+	s.RecordLatency("/", 100*time.Millisecond)
+
+	if s.routeStats["/test"] == nil {
+		t.Fatalf("expected route stats for /test")
+	}
+	if s.routeStats["/"] == nil {
+		t.Fatalf("expected route stats for /")
+	}
+}
+
+func TestRecordLatencyDoesNotPromoteIfBelowThreshold(t *testing.T) {
+	s := &Server{
+		slowCfg: SlowRequestConfig{
+			RoutePrefixes: []string{},
+		},
+		routeStats: make(map[string]*routeStats),
+	}
+
+	// Feed fast samples (below 500ms threshold)
+	for i := 0; i < 20; i++ {
+		s.RecordLatency("/fast", 100*time.Millisecond)
+	}
+
+	found := false
+	for _, p := range s.slowCfg.RoutePrefixes {
+		if p == "/fast" {
+			found = true
+			break
+		}
+	}
+	if found {
+		t.Fatalf("expected /fast not to be promoted (too fast)")
 	}
 }

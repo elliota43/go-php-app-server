@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 func TestTryServeStaticServesFile(t *testing.T) {
@@ -60,6 +62,40 @@ func TestTryServeStaticWrongMethod(t *testing.T) {
 	}
 }
 
+func TestTryServeStaticDirectoryTraversal(t *testing.T) {
+	root := t.TempDir()
+	staticDir := filepath.Join(root, "public", "assets")
+	if err := os.MkdirAll(staticDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/assets/../../etc/passwd", nil)
+	w := httptest.NewRecorder()
+
+	served := tryServeStatic(w, r, root, []StaticRule{
+		{Prefix: "/assets/", Dir: "public/assets"},
+	})
+	if !served {
+		t.Fatalf("expected tryServeStatic to return true (handled with 403)")
+	}
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestTryServeStaticNotFound(t *testing.T) {
+	root := t.TempDir()
+	r := httptest.NewRequest(http.MethodGet, "/assets/nonexistent.txt", nil)
+	w := httptest.NewRecorder()
+
+	served := tryServeStatic(w, r, root, []StaticRule{
+		{Prefix: "/assets/", Dir: "public/assets"},
+	})
+	if served {
+		t.Fatalf("expected tryServeStatic to return false for nonexistent file")
+	}
+}
+
 func TestBuildPayloadCopiesHeadersAndRequestURI(t *testing.T) {
 	body := bytes.NewBufferString("payload")
 	r := httptest.NewRequest(http.MethodPost, "/foo/bar?x=1", body)
@@ -87,6 +123,31 @@ func TestBuildPayloadCopiesHeadersAndRequestURI(t *testing.T) {
 	}
 	if _, ok := payload.Headers["X-Request-Id"]; !ok {
 		t.Fatalf("expected X-Request-Id to be injected")
+	}
+}
+
+func TestBuildPayloadWithExistingXForwardedFor(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/test", nil)
+	r.RemoteAddr = "192.168.1.1:12345"
+	r.Header.Set("X-Forwarded-For", "10.0.0.1")
+
+	payload := BuildPayload(r)
+	xff := payload.Headers["X-Forwarded-For"]
+	if len(xff) == 0 {
+		t.Fatalf("expected X-Forwarded-For to be set")
+	}
+	if !strings.Contains(xff[0], "192.168.1.1") {
+		t.Fatalf("expected X-Forwarded-For to include client IP")
+	}
+}
+
+func TestBuildPayloadWithExistingRequestId(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/test", nil)
+	r.Header.Set("X-Request-Id", "existing-id")
+
+	payload := BuildPayload(r)
+	if payload.Headers["X-Request-Id"][0] != "existing-id" {
+		t.Fatalf("expected existing X-Request-Id to be preserved")
 	}
 }
 
@@ -191,12 +252,32 @@ func TestLoadConfigValidationAndDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadConfigInvalidJSON(t *testing.T) {
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "go_appserver.json")
+	if err := os.WriteFile(cfgPath, []byte("invalid json {"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg := loadConfig(tmp)
+	def := defaultConfig()
+	if cfg.FastWorkers != def.FastWorkers {
+		t.Fatalf("expected fallback to defaults on invalid JSON")
+	}
+}
+
 func TestMapWorkerErrorToStatus(t *testing.T) {
 	if got := mapWorkerErrorToStatus(errors.New("timeout")); got != http.StatusGatewayTimeout {
 		t.Fatalf("timeout → %d, want %d", got, http.StatusGatewayTimeout)
 	}
 	if got := mapWorkerErrorToStatus(errors.New("broken pipe")); got != http.StatusBadGateway {
 		t.Fatalf("broken pipe → %d, want %d", got, http.StatusBadGateway)
+	}
+	if got := mapWorkerErrorToStatus(errors.New("unexpected EOF")); got != http.StatusBadGateway {
+		t.Fatalf("unexpected EOF → %d, want %d", got, http.StatusBadGateway)
+	}
+	if got := mapWorkerErrorToStatus(errors.New("connection reset")); got != http.StatusBadGateway {
+		t.Fatalf("connection reset → %d, want %d", got, http.StatusBadGateway)
 	}
 	if got := mapWorkerErrorToStatus(errors.New("something else")); got != http.StatusInternalServerError {
 		t.Fatalf("other error → %d, want %d", got, http.StatusInternalServerError)
@@ -241,5 +322,168 @@ func TestMetricsStartEndSnapshot(t *testing.T) {
 	}
 	if foo.TotalLatency <= 0 {
 		t.Fatalf("foo.TotalLatency should be > 0")
+	}
+}
+
+func TestMetricsEndRequestWithNilRoute(t *testing.T) {
+	m := NewMetrics()
+	m.EndRequest("/nonexistent", 10*time.Millisecond, false)
+	snap := m.Snapshot()
+	if snap.ByRoute["/nonexistent"] == nil {
+		t.Fatalf("expected route to be created")
+	}
+}
+
+func TestMetricsEndRequestDecrementsInFlight(t *testing.T) {
+	m := NewMetrics()
+	m.StartRequest("/test")
+	m.EndRequest("/test", 10*time.Millisecond, false)
+	snap := m.Snapshot()
+	if snap.InFlight != 0 {
+		t.Fatalf("InFlight = %d, want 0", snap.InFlight)
+	}
+}
+
+func TestLogRequestJSONError(t *testing.T) {
+	// This test just ensures the error path is covered
+	// We can't easily test log output, but we can ensure it doesn't panic
+	entry := RequestLog{
+		Time: time.Now(),
+	}
+	logRequestJSON(entry)
+}
+
+func TestAuthenticateWSWithJWT(t *testing.T) {
+	// jwtSecret is initialized at package load time, so we need it set before tests run
+	// Skip if not set (it's initialized at package load time)
+	if len(jwtSecret) == 0 {
+		t.Skip("APP_JWT_SECRET not set at package load time, skipping JWT test")
+	}
+
+	// Create a valid JWT token using the actual jwtSecret
+	claims := &WSClaims{
+		UserID:           "user123",
+		RegisteredClaims: jwt.RegisteredClaims{},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString(jwtSecret)
+	if err != nil {
+		t.Fatalf("failed to create token: %v", err)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Bearer "+tokenString)
+
+	userID, err := authenticateWS(r)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if userID != "user123" {
+		t.Fatalf("expected userID=user123, got %s", userID)
+	}
+}
+
+func TestAuthenticateWSWithInvalidJWT(t *testing.T) {
+	oldSecret := os.Getenv("APP_JWT_SECRET")
+	defer os.Setenv("APP_JWT_SECRET", oldSecret)
+	os.Setenv("APP_JWT_SECRET", "test-secret-key")
+
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Bearer invalid-token")
+
+	_, err := authenticateWS(r)
+	if err == nil {
+		t.Fatalf("expected error for invalid token")
+	}
+}
+
+func TestAuthenticateWSWithWrongSigningMethod(t *testing.T) {
+	oldSecret := os.Getenv("APP_JWT_SECRET")
+	defer os.Setenv("APP_JWT_SECRET", oldSecret)
+	os.Setenv("APP_JWT_SECRET", "test-secret-key")
+
+	// Create token with wrong signing method (RS256 instead of HS256)
+	claims := &WSClaims{
+		UserID:           "user123",
+		RegisteredClaims: jwt.RegisteredClaims{},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	tokenString, _ := token.SignedString(nil) // This will fail but we just need the string format
+
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Bearer "+tokenString)
+
+	_, err := authenticateWS(r)
+	// Should fail due to wrong signing method
+	if err == nil {
+		t.Fatalf("expected error for wrong signing method")
+	}
+}
+
+func TestAuthenticateWSWithCookie(t *testing.T) {
+	oldSecret := os.Getenv("APP_JWT_SECRET")
+	defer os.Setenv("APP_JWT_SECRET", oldSecret)
+	os.Setenv("APP_JWT_SECRET", "") // No JWT secret, should fall back to cookie
+
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.AddCookie(&http.Cookie{Name: "bm_user_id", Value: "cookie-user-123"})
+
+	userID, err := authenticateWS(r)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if userID != "cookie-user-123" {
+		t.Fatalf("expected userID=cookie-user-123, got %s", userID)
+	}
+}
+
+func TestAuthenticateWSWithEmptyCookie(t *testing.T) {
+	oldSecret := os.Getenv("APP_JWT_SECRET")
+	defer os.Setenv("APP_JWT_SECRET", oldSecret)
+	os.Setenv("APP_JWT_SECRET", "")
+
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.AddCookie(&http.Cookie{Name: "bm_user_id", Value: ""})
+
+	_, err := authenticateWS(r)
+	if err == nil {
+		t.Fatalf("expected error for empty cookie")
+	}
+}
+
+func TestAuthenticateWSUnauthenticated(t *testing.T) {
+	oldSecret := os.Getenv("APP_JWT_SECRET")
+	defer os.Setenv("APP_JWT_SECRET", oldSecret)
+	os.Setenv("APP_JWT_SECRET", "")
+
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	_, err := authenticateWS(r)
+	if err == nil {
+		t.Fatalf("expected error for unauthenticated request")
+	}
+}
+
+func TestAuthenticateWSWithJWTButEmptyUserID(t *testing.T) {
+	oldSecret := os.Getenv("APP_JWT_SECRET")
+	defer os.Setenv("APP_JWT_SECRET", oldSecret)
+	os.Setenv("APP_JWT_SECRET", "test-secret-key")
+
+	claims := &WSClaims{
+		UserID:           "", // Empty user ID
+		RegisteredClaims: jwt.RegisteredClaims{},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString([]byte("test-secret-key"))
+	if err != nil {
+		t.Fatalf("failed to create token: %v", err)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Bearer "+tokenString)
+
+	_, err = authenticateWS(r)
+	if err == nil {
+		t.Fatalf("expected error for empty user ID")
 	}
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -17,7 +18,9 @@ import (
 
 	"go-php/server" // IMPORTANT: change this if your module path differs
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
 type RequestLog struct {
@@ -44,6 +47,46 @@ type Metrics struct {
 	TotalErrors   uint64                   `json:"total_errors"`
 	InFlight      uint64                   `json:"in_flight"`
 	ByRoute       map[string]*RouteMetrics `json:"by_route"`
+}
+
+var (
+	// Secret for HMAC JWTs (HS256).  Set in .env
+	jwtSecret = []byte(os.Getenv("APP_JWT_SECRET"))
+)
+
+type WSClaims struct {
+	UserID string `json:"sub"`
+	jwt.RegisteredClaims
+}
+
+// authenticateWS extracts the user ID from:
+// 1) Authorization: Bearer <jwt> using HS256 + APP_JWT_SECRET
+// 2) A session cookie (e.g. bm_user_id) as a fallback
+func authenticateWS(r *http.Request) (string, error) {
+	// Authorization: Bearer <token>
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") && len(jwtSecret) > 0 {
+		tokenStr := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		claims := &WSClaims{}
+		token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, errors.New("unexpected signing method")
+			}
+			return jwtSecret, nil
+		})
+
+		if err == nil && token.Valid && claims.UserID != "" {
+			return claims.UserID, nil
+		}
+	}
+
+	// 2) fallback: session cookie containing user id
+	if c, err := r.Cookie("bm_user_id"); err == nil && c.Value != "" {
+		// @todo: verify signed/secured
+		return c.Value, nil
+	}
+
+	return "", errors.New("unauthenticated")
 }
 
 func NewMetrics() *Metrics {
@@ -302,6 +345,71 @@ func main() {
 	metrics := NewMetrics()
 	mux := http.NewServeMux()
 
+	wsHub := server.NewWSHub()
+
+	wsUpgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			// TODO: lighten up for production
+			return true
+		},
+	}
+
+	mux.HandleFunc("/__ws/user", func(w http.ResponseWriter, r *http.Request) {
+		userID, err := authenticateWS(r)
+		if err != nil || userID == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		channel := "user:" + userID
+
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("[ws] upgrade error: %v", err)
+			return
+		}
+
+		defer conn.Close()
+
+		client := wsHub.Subscribe(channel)
+		defer wsHub.Unsubscribe(channel, client)
+
+		done := make(chan struct{})
+
+		// writer goroutine
+		go func() {
+			defer close(done)
+
+			for msg := range client.Send {
+				if err := conn.WriteJSON(msg); err != nil {
+					log.Printf("[ws] write error (user %s): %v", userID, err)
+					return
+				}
+			}
+		}()
+
+		// reader loop, for now, echo messages back through the hub on the same channel
+		for {
+			var incoming map[string]any
+			if err := conn.ReadJSON(&incoming); err != nil {
+				if websocket.IsCloseError(err,
+					websocket.CloseGoingAway,
+					websocket.CloseNormalClosure,
+					websocket.CloseAbnormalClosure,
+				) {
+					return
+				}
+				log.Printf("[ws] read error (user %s): %v", userID, err)
+				return
+			}
+
+			// Optional: allow client messages to be broadcast to their own channel
+			wsHub.Publish(channel, "client", incoming)
+		}
+	})
+
 	hub := server.NewSSEHub()
 
 	// streaming routes: anything under /stream/ uses DispatchStream
@@ -331,6 +439,81 @@ func main() {
 		srv.RecordLatency(payload.Path, elapsed)
 
 		log.Printf("[req %s] %s %s -> streamed (%v)", payload.ID, payload.Method, payload.Path, elapsed)
+	})
+
+	mux.HandleFunc("/__ws", func(w http.ResponseWriter, r *http.Request) {
+		channel := r.URL.Query().Get("channel")
+		if channel == "" {
+			http.Error(w, "missing channel", http.StatusBadRequest)
+			return
+		}
+
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("[ws] upgrade error: %v", err)
+			return
+		}
+
+		defer conn.Close()
+
+		client := wsHub.Subscribe(channel)
+		defer wsHub.Unsubscribe(channel, client)
+
+		// Writer goroutine: send hub messages to this websocket
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for msg := range client.Send {
+				// send as JSON: {"type": "...", "data": {...} }
+				if err := conn.WriteJSON(msg); err != nil {
+					log.Printf("[ws] write error: %v", err)
+					return
+				}
+			}
+		}()
+
+		// Reader Loop: for now, echo messages back through the hub on the same channel
+		// @todo: change semantics
+		for {
+			var incoming map[string]any
+			if err := conn.ReadJSON(&incoming); err != nil {
+				if websocket.IsCloseError(err,
+					websocket.CloseGoingAway,
+					websocket.CloseNormalClosure,
+					websocket.CloseAbnormalClosure,
+				) {
+					return
+				}
+				log.Printf("[ws] read error: %v", err)
+				return
+			}
+
+			wsHub.Publish(channel, "client", incoming)
+		}
+	})
+
+	mux.HandleFunc("/__ws/publish", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var body struct {
+			Channel string      `json:"channel"`
+			Type    string      `json:"type"`
+			Data    interface{} `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if body.Channel == "" {
+			http.Error(w, "missing channel", http.StatusBadRequest)
+			return
+		}
+
+		wsHub.Publish(body.Channel, body.Type, body.Data)
+		w.WriteHeader(http.StatusAccepted)
 	})
 
 	// Main application handler

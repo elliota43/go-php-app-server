@@ -15,7 +15,7 @@ import (
 // newFakeStreamWorker simulates a PHP worker that speaks the streaming protocol:
 // it reads a length-prefixed RequestPayload, then emits a header frame,
 // zero or more chunk frames, and an end frame.
-func newFakeStreamWorker(t *testing.T, status int, headers map[string]string, chunks []string) *Worker {
+func newFakeStreamWorker(t *testing.T, status int, headers map[string][]string, chunks []string) *Worker {
 	t.Helper()
 
 	stdinR, stdinW := io.Pipe()
@@ -72,7 +72,7 @@ func newFakeStreamWorker(t *testing.T, status int, headers map[string]string, ch
 		}
 
 		if headers == nil {
-			headers = map[string]string{}
+			headers = map[string][]string{}
 		}
 
 		// 2) headers frame (with initial body chunk)
@@ -101,7 +101,7 @@ func newFakeStreamWorker(t *testing.T, status int, headers map[string]string, ch
 }
 
 func TestWorkerStreamHappyPath(t *testing.T) {
-	hdrs := map[string]string{"X-Test": "ok"}
+	hdrs := map[string][]string{"X-Test": {"ok"}}
 	w := newFakeStreamWorker(t, http.StatusCreated, hdrs, []string{"world"})
 
 	req := &RequestPayload{

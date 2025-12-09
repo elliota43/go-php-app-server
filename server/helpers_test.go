@@ -106,3 +106,9 @@ func newFakePool(t *testing.T, n int, timeout time.Duration) *WorkerPool {
 
 	return &WorkerPool{workers: workers}
 }
+
+type nopWriteCloser struct {
+	io.Writer
+}
+
+func (nopWriteCloser) Close() error { return nil }

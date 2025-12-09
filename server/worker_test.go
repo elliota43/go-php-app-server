@@ -65,8 +65,8 @@ func TestWorkerPoolDispatch(t *testing.T) {
 func TestWorkerTimeoutMarksDead(t *testing.T) {
 	// Build a worker with no responding goroutine to force timeout.
 	w := &Worker{
-		stdin:          nopWriteCloser{}, //writes go nowhere
-		stdout:         nopReadCloser{},  // reads block/eof
+		stdin:          nopWriteCloser{Writer: io.Discard}, //writes go nowhere
+		stdout:         nopReadCloser{},                    // reads block/eof
 		maxRequests:    1000,
 		requestTimeout: time.Millisecond,
 	}
@@ -86,11 +86,6 @@ func TestWorkerTimeoutMarksDead(t *testing.T) {
 		t.Fatalf("expected worker to be marked dead after timeout")
 	}
 }
-
-type nopWriteCloser struct{}
-
-func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
-func (nopWriteCloser) Close() error                { return nil }
 
 type nopReadCloser struct{}
 
