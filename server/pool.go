@@ -34,3 +34,19 @@ func (p *WorkerPool) Dispatch(req *RequestPayload) (*ResponsePayload, error) {
 
 	return w.Handle(req)
 }
+
+func (p *WorkerPool) Stats() PoolStats {
+	stats := PoolStats{}
+	if p == nil {
+		return stats
+	}
+
+	stats.Workers = len(p.workers)
+	for _, w := range p.workers {
+		if w.isDead() {
+			stats.DeadWorkers++
+		}
+	}
+
+	return stats
+}

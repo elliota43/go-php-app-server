@@ -9,12 +9,103 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"go-php/server" // IMPORTANT: change this if your module path differs
 
 	"github.com/google/uuid"
 )
+
+type RequestLog struct {
+	Time       time.Time `json:"time"`
+	ID         string    `json:"id"`
+	Method     string    `json:"method"`
+	Path       string    `json:"path"`
+	Status     int       `json:"status"`
+	DurationMs float64   `json:"duration_ms"`
+	RemoteAddr string    `json:"remote_addr,omitempty"`
+	UserAgent  string    `json:"user_agent,omitempty"`
+	Pool       string    `json:"pool,omitempty"` // "fast" or "slow" (@todo: will fill later)
+	Error      string    `json:"error,omitempty"`
+}
+
+type RouteMetrics struct {
+	Count        uint64        `json:"count"`
+	TotalLatency time.Duration `json:"total_lacency_ns"`
+}
+
+type Metrics struct {
+	mu            sync.Mutex
+	TotalRequests uint64                   `json:"total_requests"`
+	TotalErrors   uint64                   `json:"total_errors"`
+	InFlight      uint64                   `json:"in_flight"`
+	ByRoute       map[string]*RouteMetrics `json:"by_route"`
+}
+
+func NewMetrics() *Metrics {
+	return &Metrics{
+		ByRoute: make(map[string]*RouteMetrics),
+	}
+}
+
+func (m *Metrics) StartRequest(route string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.InFlight++
+	m.TotalRequests++
+	if _, ok := m.ByRoute[route]; !ok {
+		m.ByRoute[route] = &RouteMetrics{}
+	}
+}
+
+func (m *Metrics) EndRequest(route string, latency time.Duration, err bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.InFlight > 0 {
+		m.InFlight--
+	}
+	if err {
+		m.TotalErrors++
+	}
+
+	rm := m.ByRoute[route]
+	if rm == nil {
+		rm = &RouteMetrics{}
+		m.ByRoute[route] = rm
+	}
+	rm.Count++
+	rm.TotalLatency += latency
+}
+
+func (m *Metrics) Snapshot() Metrics {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	copy := Metrics{
+		TotalRequests: m.TotalRequests,
+		TotalErrors:   m.TotalErrors,
+		InFlight:      m.InFlight,
+		ByRoute:       make(map[string]*RouteMetrics, len(m.ByRoute)),
+	}
+
+	for route, rm := range m.ByRoute {
+		rmCopy := *rm
+		copy.ByRoute[route] = &rmCopy
+	}
+
+	return copy
+}
+
+func logRequestJSON(entry RequestLog) {
+	b, err := json.Marshal(entry)
+	if err != nil {
+		log.Printf("error marshaling log entry: %v", err)
+		return
+	}
+	log.Println(string(b))
+}
 
 //
 // -------------------------------------------------------------
@@ -206,6 +297,32 @@ func main() {
 		timeout,
 		slowCfg,
 	)
+
+	http.HandleFunc("/__baremetal/health", func(w http.ResponseWriter, r *http.Request) {
+		summary := srv.Health()
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(summary); err != nil {
+			http.Error(w, "Failed to encode health summary", http.StatusInternalServerError)
+			return
+		}
+	})
+
+	http.HandleFunc("/__baremetal/recycle", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		// For now, this is a brutal "mark all dead" so next requests spawn fresh workers
+		srv.ForceRecycleWorkers() // we'll define this
+
+		w.Header().Set("Content-Type", "application/json")
+
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status": "ok",
+			"note":   "all workers marked dead; will respawn on next requests",
+		})
+	})
 	if err != nil {
 		log.Fatal("Failed creating worker pools:", err)
 	}
@@ -232,6 +349,8 @@ func main() {
 	}
 	log.Println("=============================================")
 
+	metrics := NewMetrics()
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 
 		// 1) Try static assets first
@@ -243,6 +362,13 @@ func main() {
 		payload := BuildPayload(r)
 		start := time.Now()
 
+		// wire metrics
+		routeKey := r.URL.Path
+		if routeKey == "" {
+			routeKey = "/"
+		}
+		metrics.StartRequest(routeKey)
+
 		// TEMP streaming demo toggle by request header
 		if r.Header.Get("X-Go-Stream") == "1" {
 			if err := srv.DispatchStream(payload, w); err != nil {
@@ -251,6 +377,7 @@ func main() {
 				return
 			}
 			elapsed := time.Since(start)
+			srv.RecordLatency(payload.Path, elapsed)
 			log.Printf("[req %s] %s %s -> streamed (%v)", payload.ID, payload.Method, payload.Path, elapsed)
 			return
 		}
@@ -259,7 +386,7 @@ func main() {
 		resp, err := srv.Dispatch(payload)
 		if err != nil {
 			writeWorkerError(w, err)
-			log.Println("[req %s] %s %s -> worker error: %v", payload.ID, payload.Method, payload.Path, err)
+			log.Printf("[req %s] %s %s -> worker error: %v", payload.ID, payload.Method, payload.Path, err)
 			return
 		}
 
@@ -285,8 +412,29 @@ func main() {
 
 		// 5) Log successful request
 		elapsed := time.Since(start)
-		log.Printf("[req %s] %s %s -> %d (%v)",
-			payload.ID, payload.Method, payload.Path, status, elapsed)
+		metrics.EndRequest(routeKey, elapsed, false)
+		entry := RequestLog{
+			Time:       time.Now(),
+			ID:         payload.ID,
+			Method:     payload.Method,
+			Path:       payload.Path,
+			Status:     status,
+			DurationMs: float64(elapsed.Milliseconds()),
+			RemoteAddr: r.RemoteAddr,
+			UserAgent:  r.UserAgent(),
+			// pools will be set if we expose it from server - fil in later ,
+		}
+
+		logRequestJSON(entry)
+	})
+
+	// prometheus style metrics endpoint
+	http.HandleFunc("/__baremetal/metrics", func(w http.ResponseWriter, r *http.Request) {
+		snap := metrics.Snapshot()
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(snap); err != nil {
+			http.Error(w, "failed to encode metrics", http.StatusInternalServerError)
+		}
 	})
 
 	addr := os.Getenv("APP_SERVER_ADDR")

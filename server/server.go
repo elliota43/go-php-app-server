@@ -6,12 +6,29 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
+// PoolStats describes the state of a worker pool.
+type PoolStats struct {
+	Workers     int `json:"workers"`
+	DeadWorkers int `json:"dead_workers"`
+}
+
+type routeStats struct {
+	count        uint64
+	totalLatency time.Duration
+}
+
+// HealthSummary returns the health of the fast and slow pools.
+type HealthSummary struct {
+	Fast PoolStats `json:"fast_pool"`
+	Slow PoolStats `json:"slow_pool"`
+}
 type SlowRequestConfig struct {
 	RoutePrefixes []string
 	Methods       []string
@@ -22,6 +39,9 @@ type Server struct {
 	fastPool *WorkerPool
 	slowPool *WorkerPool
 	slowCfg  SlowRequestConfig
+
+	routeMu    sync.Mutex
+	routeStats map[string]*routeStats
 }
 
 // NewServer builds fast and slow pools with shared settings.
@@ -46,9 +66,10 @@ func NewServer(fastCount, slowCount, maxRequests int, requestTimeout time.Durati
 	}
 
 	return &Server{
-		fastPool: fp,
-		slowPool: sp,
-		slowCfg:  slowCfg,
+		fastPool:   fp,
+		slowPool:   sp,
+		slowCfg:    slowCfg,
+		routeStats: make(map[string]*routeStats),
 	}, nil
 }
 
@@ -70,6 +91,56 @@ func (s *Server) IsSlowRequest(r *RequestPayload) bool {
 	method := strings.ToUpper(r.Method)
 	for _, m := range s.slowCfg.Methods {
 		if method == strings.ToUpper(m) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (s *Server) Health() HealthSummary {
+	return HealthSummary{
+		Fast: s.fastPool.Stats(),
+		Slow: s.slowPool.Stats(),
+	}
+}
+
+func (s *Server) RecordLatency(path string, d time.Duration) {
+	// Use the first path segment as the "prefix" key: /users/1 -> /users
+	prefix := path
+	if strings.HasPrefix(prefix, "/") {
+		slash := strings.Index(prefix[1:], "/")
+		if slash != -1 {
+			prefix = prefix[:slash+1]
+		}
+	}
+
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+
+	rs := s.routeStats[prefix]
+	if rs == nil {
+		rs = &routeStats{}
+		s.routeStats[prefix] = rs
+	}
+
+	rs.count++
+	rs.totalLatency += d
+
+	// Very naive promotion: if avg latency > 500ms and not already in slowCfg.RoutePrefixes, add it
+	if rs.count >= 10 { // need some samples
+		avg := rs.totalLatency / time.Duration(rs.count)
+		if avg > 500*time.Millisecond && !s.hasSlowPrefix(prefix) {
+			s.slowCfg.RoutePrefixes = append(s.slowCfg.RoutePrefixes, prefix)
+			log.Printf("[adaptive] promoting prefix %q to slow pool (avg=%v, count=%d)", prefix, avg, rs.count)
+		}
+
+	}
+}
+
+func (s *Server) hasSlowPrefix(prefix string) bool {
+	for _, p := range s.slowCfg.RoutePrefixes {
+		if p == prefix {
 			return true
 		}
 	}
@@ -114,6 +185,10 @@ func (s *Server) markAllWorkersDead() {
 	for _, w := range s.slowPool.workers {
 		w.markDead()
 	}
+}
+
+func (s *Server) ForceRecycleWorkers() {
+	s.markAllWorkersDead()
 }
 
 // EnableHotReload watches php/ and routes/ under projectRoot and marks all
